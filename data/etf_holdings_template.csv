@@ -1,0 +1,4 @@
+etf_ticker,etf_isin,snapshot_date,holding_name,holding_ticker,holding_isin,asset_type,sector,country,shares,weight,market_value
+SPY,US78462F1030,2025-03-09,NVIDIA Corp,NVDA,,Equity,Technology,United States,,7.31,
+SPY,US78462F1030,2025-03-09,Apple Inc,AAPL,,Equity,Technology,United States,,6.63,
+SPY,US78462F1030,2025-03-09,Microsoft Corp,MSFT,,Equity,Technology,United States,,4.96,
