@@ -5,14 +5,23 @@ Uses strategy_signals for rebalance dates and weights, prices_daily for NAV.
 Applies 10 bps transaction cost per traded weight. Outputs metrics and
 saves results to backtest_daily, backtest_benchmarks, and backtest_summary.
 
+IMPORTANT: Requires historical signals. Run generate_signals.py --historical first.
+Otherwise strategy_signals has only the latest date and the backtest is not meaningful.
+
 SQL schemas (tables created automatically if not exist):
 
   backtest_daily:     date DATE, nav DOUBLE
   backtest_benchmarks: date DATE, ticker TEXT, nav DOUBLE
   backtest_summary:   metric TEXT, value DOUBLE
+
+Future improvements (not critical for MVP):
+  A. Run metadata: run_id, run_timestamp, strategy_name (avoid wiping previous results)
+  B. Benchmark metrics in DB: CAGR, vol, max_dd per benchmark (not just printed)
+  C. Signal coverage diagnostics: avg ETFs per rebalance, count of rebalances with <5 ETFs
 """
 from __future__ import annotations
 
+import bisect
 import math
 from pathlib import Path
 from typing import Optional
@@ -110,19 +119,23 @@ def get_rebalance_dates(signals: pd.DataFrame) -> list[pd.Timestamp]:
 
 def get_target_weights_for_date(
     signals: pd.DataFrame,
-    rebalance_date: pd.Timestamp,
+    signal_date: pd.Timestamp,
     prices: pd.DataFrame,
+    execution_date: pd.Timestamp | None = None,
 ) -> dict[str, float]:
     """
-    Get target weights for a rebalance date.
-    Skips ETFs with no valid price on that date. Equal weight the rest.
+    Get target weights for a rebalance.
+    Uses signal_date for ticker selection; execution_date for price lookup
+    (when signal date is not a trading day, we execute on the next).
+    Skips ETFs with no valid price on execution date. Equal weight the rest.
     """
-    day_signals = signals[signals["date"] == rebalance_date]
+    day_signals = signals[signals["date"] == signal_date]
     if day_signals.empty:
         return {}
 
+    price_date = execution_date if execution_date is not None else signal_date
     day_prices = prices[
-        (prices["date"] == rebalance_date) & (prices["close"].notna()) & (prices["close"] > 0)
+        (prices["date"] == price_date) & (prices["close"].notna()) & (prices["close"] > 0)
     ]
     valid_tickers = set(day_prices["ticker"].unique())
 
@@ -138,50 +151,104 @@ def compute_turnover(
     old_weights: dict[str, float],
     new_weights: dict[str, float],
 ) -> float:
-    """Sum of absolute weight changes (one-way turnover)."""
+    """One-way turnover: 0.5 * sum of absolute weight changes."""
     all_tickers = set(old_weights) | set(new_weights)
-    return sum(abs(new_weights.get(t, 0) - old_weights.get(t, 0)) for t in all_tickers)
+    return 0.5 * sum(
+        abs(new_weights.get(t, 0.0) - old_weights.get(t, 0.0))
+        for t in all_tickers
+    )
+
+
+def map_rebalance_to_trading_dates(
+    rebalance_dates: list[pd.Timestamp],
+    trading_dates: list[pd.Timestamp],
+) -> dict[pd.Timestamp, pd.Timestamp]:
+    """
+    Map each signal/rebalance date to the next available trading date.
+    Returns effective_trading_date -> signal_date.
+
+    When signal dates are month-end and the market is closed, we execute
+    on the next trading day. If multiple signal dates map to the same
+    trading date, we use the latest signal.
+    """
+    if not trading_dates:
+        return {}
+    trading_sorted = sorted(trading_dates)
+
+    effective_to_signal: dict[pd.Timestamp, pd.Timestamp] = {}
+    for r in rebalance_dates:
+        idx = bisect.bisect_left(trading_sorted, r)
+        if idx >= len(trading_sorted):
+            continue
+        next_trading = trading_sorted[idx]
+        if next_trading not in effective_to_signal or r > effective_to_signal[next_trading]:
+            effective_to_signal[next_trading] = r
+
+    return effective_to_signal
 
 
 def run_backtest(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
     rebalance_dates: list[pd.Timestamp],
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, float, int]:
     """
-    Run backtest. Returns (daily_nav_df, total_turnover).
+    Run backtest. Returns (daily_nav_df, total_turnover, n_rebalances).
+
+    Initial entry: Option A — no cost to enter the initial portfolio at NAV = 1.0.
+    Transaction costs apply only at subsequent rebalances.
+    (Option B would charge: nav *= 1 - COST_PER_WEIGHT * sum(weights) after init.)
     """
     # Build price pivot: date x ticker
     price_pivot = prices.pivot(index="date", columns="ticker", values="close")
     price_pivot = price_pivot.ffill()  # forward-fill missing prices
+    # Note: ffill can create artificial flat returns when one ETF is closed and another
+    # is open. For later: compute returns per ticker first, then join by date; use 0
+    # return only when truly appropriate.
 
     all_dates = sorted(price_pivot.index.unique())
     if not all_dates:
         raise ValueError("No price data in date range.")
 
-    first_rebal = rebalance_dates[0]
-    start_idx = all_dates.index(first_rebal) if first_rebal in all_dates else 0
+    # Map signal dates to next available trading date (handles month-end when market closed)
+    effective_to_signal = map_rebalance_to_trading_dates(rebalance_dates, all_dates)
+    if not effective_to_signal:
+        raise ValueError("No rebalance date maps to a trading date.")
+
+    first_effective = min(effective_to_signal.keys())
+    start_idx = all_dates.index(first_effective) if first_effective in all_dates else 0
     trading_dates = all_dates[start_idx:]
 
-    # Initial weights at first rebalance
-    weights = get_target_weights_for_date(signals, first_rebal, prices)
+    # Initial weights at first rebalance (use execution date for price lookup).
+    # Option A: no initial entry cost — we start fully invested at NAV = 1.0.
+    first_signal = effective_to_signal[first_effective]
+    weights = get_target_weights_for_date(
+        signals, first_signal, prices, execution_date=first_effective
+    )
     if not weights:
-        raise ValueError(f"No valid prices for any signal ETF on {first_rebal.date()}")
+        raise ValueError(
+            f"No valid prices for any signal ETF on {first_effective.date()} "
+            f"(signal date {first_signal.date()})"
+        )
 
     nav_series = []
     nav = 1.0
     total_turnover = 0.0
+    n_rebalances = 0
 
     prev_date = None
-    prev_prices = {}
 
     for i, d in enumerate(trading_dates):
-        # Rebalance?
-        if d in rebalance_dates:
-            new_weights = get_target_weights_for_date(signals, d, prices)
+        # Rebalance? (d is effective trading date)
+        if d in effective_to_signal:
+            signal_date = effective_to_signal[d]
+            new_weights = get_target_weights_for_date(
+                signals, signal_date, prices, execution_date=d
+            )
             if new_weights:
                 turnover = compute_turnover(weights, new_weights)
                 total_turnover += turnover
+                n_rebalances += 1
                 cost = COST_PER_WEIGHT * turnover
                 nav *= 1 - cost
                 weights = new_weights
@@ -190,12 +257,10 @@ def run_backtest(
         row = price_pivot.loc[d]
         ret = 0.0
         for ticker, w in weights.items():
-            if ticker not in price_pivot.columns:
-                continue
             p_today = row.get(ticker)
             if pd.isna(p_today) or p_today <= 0:
                 continue
-            if prev_date is not None and ticker in price_pivot.loc[prev_date]:
+            if prev_date is not None and ticker in price_pivot.columns:
                 p_yesterday = price_pivot.loc[prev_date, ticker]
                 if pd.notna(p_yesterday) and p_yesterday > 0:
                     ret += w * (p_today / p_yesterday - 1)
@@ -208,7 +273,7 @@ def run_backtest(
         prev_date = d
 
     df = pd.DataFrame(nav_series)
-    return df, total_turnover
+    return df, total_turnover, n_rebalances
 
 
 def compute_benchmark_nav(
@@ -380,8 +445,7 @@ def run_backtest_main(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Loaded {len(prices):,} price rows")
 
     # 4. Run backtest
-    nav_df, total_turnover = run_backtest(signals, prices, rebalance_dates)
-    n_rebalances = len(rebalance_dates)
+    nav_df, total_turnover, n_rebalances = run_backtest(signals, prices, rebalance_dates)
 
     if nav_df.empty:
         print("Error: Backtest produced no NAV series.")

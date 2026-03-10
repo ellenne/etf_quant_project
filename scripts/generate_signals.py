@@ -1,11 +1,13 @@
 """
 Generate strategy signals from ETF features.
 
-Reads the latest date from etf_features, applies filters and scoring,
-and writes top 5 ETFs (equal-weighted) to strategy_signals.
+By default: generates signals for the latest date only (for live/forward use).
+With --historical: generates signals for the last date of each month in etf_features,
+enabling meaningful backtests.
 """
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +35,32 @@ def get_latest_date(con: duckdb.DuckDBPyConnection) -> Optional[pd.Timestamp]:
         "SELECT MAX(date) AS max_date FROM etf_features"
     ).fetchone()[0]
     return pd.Timestamp(result) if result is not None else None
+
+
+def get_historical_signal_dates(con: duckdb.DuckDBPyConnection) -> list[pd.Timestamp]:
+    """
+    Get last date of each month in etf_features.
+    Required for backtest: one rebalance date per month, top 5 ETFs each.
+    """
+    df = con.execute(
+        """
+        SELECT DISTINCT date
+        FROM etf_features
+        ORDER BY date
+        """
+    ).fetchdf()
+
+    if df.empty:
+        return []
+
+    df["date"] = pd.to_datetime(df["date"])
+    # Group by (year, month), take last date per month
+    last_per_month = (
+        df.groupby([df["date"].dt.year, df["date"].dt.month])["date"]
+        .max()
+        .tolist()
+    )
+    return sorted(last_per_month)
 
 
 def load_features_for_date(
@@ -156,6 +184,17 @@ def insert_signals(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate strategy signals from ETF features"
+    )
+    parser.add_argument(
+        "--historical",
+        action="store_true",
+        help="Generate signals for last date of each month (for backtest). "
+        "Default: latest date only.",
+    )
+    args = parser.parse_args()
+
     try:
         con = duckdb.connect(str(DB_PATH), read_only=False)
     except Exception as e:
@@ -164,80 +203,123 @@ def main() -> None:
         return
 
     try:
-        run_signal_generation(con)
+        run_signal_generation(con, historical=args.historical)
     finally:
         con.close()
 
 
-def run_signal_generation(con: duckdb.DuckDBPyConnection) -> None:
-    """Core logic: load features, filter, score, and write signals."""
-    # 1. Get latest date
-    latest_date = get_latest_date(con)
-    if latest_date is None:
-        print("Error: etf_features is empty. Run build_features.py first.")
-        return
-
-    print(f"Latest feature date: {latest_date.date()}")
-
-    # 2. Load features for that date
-    df = load_features_for_date(con, latest_date)
-    n_raw = len(df)
-
+def generate_signals_for_date(
+    con: duckdb.DuckDBPyConnection,
+    signal_date: pd.Timestamp,
+) -> tuple[int, int] | None:
+    """
+    Generate signals for a single date. Returns (n_trend, n_selected) or None if failed.
+    """
+    df = load_features_for_date(con, signal_date)
     if df.empty:
-        print(f"Error: No feature rows for {latest_date.date()}")
-        return
+        return None
 
-    print(f"ETFs with features on this date: {n_raw}")
-
-    # 3. Filter: valid features
     df = filter_valid_features(df)
-    n_valid = len(df)
-    print(f"After excluding null momentum/vol/drawdown: {n_valid}")
-
     if df.empty:
-        print("Error: No ETFs passed the validity filter.")
-        return
+        return None
 
-    # 4. Filter: trend (price above 200d MA)
     df = apply_trend_filter(df)
-    n_trend = len(df)
-    print(f"After trend filter (price_vs_200dma > 0): {n_trend}")
-
     if df.empty:
-        print("Error: No ETFs passed the trend filter.")
-        return
+        return None
 
-    # 5. Compute scores
     df = compute_scores(df)
-
-    # 6. Select top N and assign weights
     signals = select_top_and_assign_weights(df)
-    n_selected = len(signals)
 
-    # 7. Delete existing rows for this date
-    deleted = delete_existing_signals(con, latest_date)
-    if deleted > 0:
-        print(f"Deleted {deleted} existing signal rows for {latest_date.date()}")
-
-    # 8. Insert new signals
+    delete_existing_signals(con, signal_date)
     insert_signals(con, signals)
-    print(f"Inserted {n_selected} signal rows")
 
-    # 9. Summary
-    print("\n" + "=" * 60)
-    print("SIGNAL GENERATION SUMMARY")
-    print("=" * 60)
-    print(f"Latest signal date:    {latest_date.date()}")
-    print(f"ETFs considered:      {n_trend}")
-    print(f"ETFs selected:        {n_selected}")
+    return len(df), len(signals)
 
-    # 10. Top 10 ranked (by score) for display
-    top10 = df.sort_values("score", ascending=False).head(10)
-    print("\nTop 10 ranked ETFs (by score):")
-    print("-" * 50)
-    for i, row in enumerate(top10.itertuples(), 1):
-        sel = " *" if i <= TOP_N else ""
-        print(f"  {i:2}. {row.ticker:8}  score={row.score:.4f}{sel}")
+
+def run_signal_generation(
+    con: duckdb.DuckDBPyConnection,
+    historical: bool = False,
+) -> None:
+    """Core logic: load features, filter, score, and write signals."""
+    if historical:
+        signal_dates = get_historical_signal_dates(con)
+        if not signal_dates:
+            print("Error: etf_features is empty. Run build_features.py first.")
+            return
+
+        print(f"Historical mode: generating signals for {len(signal_dates)} month-ends")
+        print(f"Date range: {signal_dates[0].date()} to {signal_dates[-1].date()}\n")
+
+        total_inserted = 0
+        for i, d in enumerate(signal_dates):
+            result = generate_signals_for_date(con, d)
+            if result:
+                n_trend, n_selected = result
+                total_inserted += n_selected
+                if (i + 1) % 12 == 0 or i == 0 or i == len(signal_dates) - 1:
+                    print(f"  {d.date()}: {n_selected} ETFs selected (from {n_trend} considered)")
+
+        print("\n" + "=" * 60)
+        print("HISTORICAL SIGNAL GENERATION SUMMARY")
+        print("=" * 60)
+        print(f"Months processed:    {len(signal_dates)}")
+        print(f"Total signal rows:   {total_inserted}")
+        print("\nRun backtest_strategy.py for a meaningful historical backtest.")
+    else:
+        # Latest date only (default)
+        latest_date = get_latest_date(con)
+        if latest_date is None:
+            print("Error: etf_features is empty. Run build_features.py first.")
+            return
+
+        print(f"Latest feature date: {latest_date.date()}")
+
+        df = load_features_for_date(con, latest_date)
+        if df.empty:
+            print(f"Error: No feature rows for {latest_date.date()}")
+            return
+
+        print(f"ETFs with features on this date: {len(df)}")
+
+        df = filter_valid_features(df)
+        print(f"After excluding null momentum/vol/drawdown: {len(df)}")
+        if df.empty:
+            print("Error: No ETFs passed the validity filter.")
+            return
+
+        df = apply_trend_filter(df)
+        n_trend = len(df)
+        print(f"After trend filter (price_vs_200dma > 0): {n_trend}")
+        if df.empty:
+            print("Error: No ETFs passed the trend filter.")
+            return
+
+        df = compute_scores(df)
+        signals = select_top_and_assign_weights(df)
+        n_selected = len(signals)
+
+        deleted = delete_existing_signals(con, latest_date)
+        if deleted > 0:
+            print(f"Deleted {deleted} existing signal rows for {latest_date.date()}")
+
+        insert_signals(con, signals)
+        print(f"Inserted {n_selected} signal rows")
+
+        print("\n" + "=" * 60)
+        print("SIGNAL GENERATION SUMMARY")
+        print("=" * 60)
+        print(f"Latest signal date:    {latest_date.date()}")
+        print(f"ETFs considered:      {n_trend}")
+        print(f"ETFs selected:        {n_selected}")
+
+        top10 = df.sort_values("score", ascending=False).head(10)
+        print("\nTop 10 ranked ETFs (by score):")
+        print("-" * 50)
+        for i, row in enumerate(top10.itertuples(), 1):
+            sel = " *" if i <= TOP_N else ""
+            print(f"  {i:2}. {row.ticker:8}  score={row.score:.4f}{sel}")
+
+        print("\nFor historical backtest, run: python scripts/generate_signals.py --historical")
 
     print("\nDone.")
 
