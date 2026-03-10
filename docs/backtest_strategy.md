@@ -11,7 +11,7 @@ python scripts/backtest_strategy.py
 ## Prerequisites
 
 - Database with `strategy_signals`, `prices_daily`, and backtest tables
-- Signals generated (run `generate_signals.py` first)
+- **Historical signals** — Run `generate_signals.py --historical` first. The backtest is only meaningful if `strategy_signals` contains one rebalance date per month with top 5 ETFs. Default `generate_signals.py` (latest only) does not produce a real historical test.
 - Price data loaded (run `etl_prices.py`)
 
 ## Pipeline
@@ -27,8 +27,8 @@ python scripts/backtest_strategy.py
 ## Transaction Costs
 
 - **10 basis points** (0.001) per traded weight change
-- At rebalance: cost = 0.001 × Σ|Δweight|
-- Example: going from 0 to 0.20 in one ETF → cost = 0.0002 (2 bps of portfolio)
+- At rebalance: cost = 0.001 × one-way turnover (0.5 × Σ|Δweight|)
+- **Initial entry**: No cost — portfolio starts fully invested at NAV = 1.0 (Option A). Costs apply only at subsequent rebalances.
 
 ## Output Tables
 

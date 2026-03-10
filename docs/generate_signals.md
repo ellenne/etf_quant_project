@@ -1,12 +1,18 @@
 # generate_signals.py
 
-Generates strategy signals from ETF features. Reads the latest date from `etf_features`, applies filters and scoring, and writes the top 5 ETFs (equal-weighted) to `strategy_signals`.
+Generates strategy signals from ETF features. By default: latest date only. With `--historical`: last date of each month (required for meaningful backtests).
 
 ## Usage
 
 ```bash
+# Latest date only (for live/forward use)
 python scripts/generate_signals.py
+
+# Historical: one rebalance date per month (for backtest)
+python scripts/generate_signals.py --historical
 ```
+
+**For backtest:** Run `--historical` first so `strategy_signals` contains one month-end per month with top 5 ETFs. Without this, the backtest has no real historical test.
 
 ## Prerequisites
 
