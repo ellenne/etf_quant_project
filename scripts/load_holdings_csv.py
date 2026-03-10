@@ -7,22 +7,43 @@ CSV format (header required):
 
 Minimal required columns: etf_ticker, holding_name, holding_ticker, weight
 Other columns can be empty. snapshot_date defaults to today if missing.
+Weight can be "1.96%" or 1.96 (percent sign stripped automatically).
 """
 from __future__ import annotations
 
+import argparse
 from datetime import date
 from pathlib import Path
 import duckdb
 import pandas as pd
 
-DB_PATH = "db/etf_data.duckdb"
-CSV_PATH = "data/etf_holdings.csv"
+# Paths relative to project root (parent of scripts/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = PROJECT_ROOT / "db" / "etf_data.duckdb"
+DEFAULT_CSV = PROJECT_ROOT / "data" / "etf_holdings.csv"
+FALLBACK_CSV = PROJECT_ROOT / "data" / "etf_holdings_template.csv"
 
 
 def main() -> None:
-    csv_file = Path(CSV_PATH)
+    parser = argparse.ArgumentParser(description="Load ETF holdings from CSV")
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="Path to CSV file (default: data/etf_holdings.csv, fallback: data/etf_holdings_template.csv)",
+    )
+    args = parser.parse_args()
+
+    csv_file = args.csv
+    if csv_file is None:
+        csv_file = DEFAULT_CSV if DEFAULT_CSV.exists() else FALLBACK_CSV
+    else:
+        csv_file = Path(csv_file)
+        if not csv_file.is_absolute():
+            csv_file = PROJECT_ROOT / csv_file
+
     if not csv_file.exists():
-        print(f"Holdings file not found: {CSV_PATH}")
+        print(f"Holdings file not found: {csv_file}")
         print("\nCreate a CSV with columns (minimal: etf_ticker, holding_name, holding_ticker, weight):")
         print("  etf_ticker,etf_isin,snapshot_date,holding_name,holding_ticker,holding_isin,asset_type,sector,country,shares,weight,market_value")
         print("\nExample rows:")
@@ -31,14 +52,25 @@ def main() -> None:
         print("\nCopy from: finance.yahoo.com/quote/SPY/holdings/ or provider sites (iShares, Vanguard, SPDR)")
         return
 
+    print(f"Loading from: {csv_file}")
     df = pd.read_csv(csv_file)
 
-    required = ["etf_ticker", "holding_name", "holding_ticker", "weight"]
+    required = ["etf_ticker", "holding_name", "weight"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"CSV must have columns: {required}. Missing: {missing}")
 
     df = df.copy()
+
+    # Parse weight: strip "%" and convert to numeric (e.g. "1.96%" -> 1.96)
+    df["weight"] = df["weight"].astype(str).str.replace("%", "", regex=False).str.strip()
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
+
+    # holding_ticker optional (bonds often have none)
+    if "holding_ticker" not in df.columns:
+        df["holding_ticker"] = None
+    else:
+        df["holding_ticker"] = df["holding_ticker"].fillna("").astype(str)
 
     # Fill defaults
     if "snapshot_date" not in df.columns:
@@ -52,7 +84,7 @@ def main() -> None:
 
     df["data_source"] = df["data_source"].fillna("manual_csv")
 
-    con = duckdb.connect(DB_PATH)
+    con = duckdb.connect(str(DB_PATH))
 
     # Delete existing rows for these ETF/snapshot_date pairs
     for (etf, snap) in df[["etf_ticker", "snapshot_date"]].drop_duplicates().itertuples(index=False):
@@ -86,7 +118,7 @@ def main() -> None:
     """)
 
     row_count = len(df)
-    print(f"Loaded {row_count} holdings from {CSV_PATH}")
+    print(f"Loaded {row_count} holdings from {csv_file}")
 
 
 if __name__ == "__main__":

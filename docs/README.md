@@ -17,6 +17,8 @@ Detailed documentation for each script in the ETF Quant project.
 | Script | Doc | Description |
 |--------|-----|-------------|
 | `build_features.py` | [build_features.md](build_features.md) | Compute features from price data |
+| `generate_signals.py` | [generate_signals.md](generate_signals.md) | Generate strategy signals (top 5 ETFs) |
+| `backtest_strategy.py` | [backtest_strategy.md](backtest_strategy.md) | Backtest monthly rotation strategy |
 
 ## Utilities & Testing
 
