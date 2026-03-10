@@ -83,4 +83,54 @@ CREATE TABLE IF NOT EXISTS strategy_signals (
 )
 """)
 
+# asset_master
+con.execute("""
+CREATE TABLE IF NOT EXISTS asset_master (
+    asset_id TEXT,
+    canonical_name TEXT,
+    canonical_ticker TEXT,
+    isin TEXT,
+    cusip TEXT,
+    sedol TEXT,
+    asset_type TEXT,
+    sector TEXT,
+    industry TEXT,
+    country TEXT,
+    currency TEXT,
+    issuer TEXT
+)
+""")
+
+# asset_alias
+con.execute("""
+CREATE TABLE IF NOT EXISTS asset_alias (
+    alias_name TEXT,
+    alias_ticker TEXT,
+    alias_isin TEXT,
+    asset_id TEXT,
+    source TEXT
+)
+""")
+
+# backtest results (populated by backtest_strategy.py)
+con.execute("""
+CREATE TABLE IF NOT EXISTS backtest_daily (
+    date DATE,
+    nav DOUBLE
+)
+""")
+con.execute("""
+CREATE TABLE IF NOT EXISTS backtest_benchmarks (
+    date DATE,
+    ticker TEXT,
+    nav DOUBLE
+)
+""")
+con.execute("""
+CREATE TABLE IF NOT EXISTS backtest_summary (
+    metric TEXT,
+    value DOUBLE
+)
+""")
+
 print("Database initialized successfully")
