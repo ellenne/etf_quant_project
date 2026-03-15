@@ -28,6 +28,9 @@ Detailed documentation for each script in the ETF Quant project.
 | `analyze_backtest_results.py` | [analyze_backtest_results.md](analyze_backtest_results.md) | Analyze backtest results, benchmarks, signals, sectors |
 | `research_strategy_variants.py` | [research_strategy_variants.md](research_strategy_variants.md) | Compare multiple strategy variants |
 | `research_regime_filter_variants.py` | [research_regime_filter_variants.md](research_regime_filter_variants.md) | Test regime filter robustness |
+| `analyze_regime_filter_winners.py` | [analyze_regime_filter_winners.md](analyze_regime_filter_winners.md) | Deep analysis of winning regime strategies |
+
+## Utilities & Testing
 
 | Script | Doc | Description |
 |--------|-----|-------------|
